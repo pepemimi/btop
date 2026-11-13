@@ -2528,8 +2528,9 @@ namespace Gpu {
 				npu.has_power = not npu.hwmon.empty() and
 					(fs::exists(npu.hwmon / "power1_average") or fs::exists(npu.hwmon / "power1_input"));
 
-				if (not (npu.has_busy or npu.has_busy_time or npu.has_temp or npu.has_power or npu.has_frequency)) {
-					Logger::debug("NPU: skipping {} because no readable metrics were found", entry.path());
+				if (not (npu.has_busy or npu.has_busy_time or npu.has_temp or npu.has_power or npu.has_frequency or npu.amd)) {
+					Logger::debug("NPU: skipping {} because no readable metrics were found (driver={}, AMD={}, busy={}, busy_time={}, temp={}, power={}, frequency={})",
+						entry.path(), npu.driver, npu.amd, npu.has_busy, npu.has_busy_time, npu.has_temp, npu.has_power, npu.has_frequency);
 					continue;
 				}
 				Logger::debug("NPU: found {} (driver={}, PCI ID={:04x}:{:04x})",
