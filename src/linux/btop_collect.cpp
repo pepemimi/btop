@@ -2371,6 +2371,18 @@ namespace Gpu {
 				}
 			}
 
+			static string read_uevent_field(const fs::path& path, const string_view field) {
+				std::ifstream file(path);
+				if (not file.good()) return {};
+
+				const string prefix = string(field) + '=';
+				for (string line; getline(file, line);) {
+					if (line.starts_with(prefix))
+						return line.substr(prefix.size());
+				}
+				return {};
+			}
+
 			static double sensor_value(uint32_t input, int8_t exponent) {
 				return static_cast<double>(input) * pow(10.0, exponent);
 			}
@@ -2481,26 +2493,20 @@ namespace Gpu {
 					continue;
 				}
 
-				const string driver = readfile(uevent, "");
-				const auto driver_pos = driver.find("DRIVER=");
-				const auto pci_pos = driver.find("PCI_ID=");
-				const auto slot_pos = driver.find("PCI_SLOT_NAME=");
-				if (pci_pos == string::npos or slot_pos == string::npos) {
+				const string driver_name = read_uevent_field(uevent, "DRIVER");
+				const string pci_id = read_uevent_field(uevent, "PCI_ID");
+				const string pci_slot = read_uevent_field(uevent, "PCI_SLOT_NAME");
+				if (pci_id.empty() or pci_slot.empty()) {
 					Logger::debug("NPU: skipping {} because PCI_ID or PCI_SLOT_NAME is missing", entry.path());
 					continue;
 				}
 
-				const auto pci_line_end = driver.find('\n', pci_pos);
-				const auto pci_id = driver.substr(pci_pos + 8, pci_line_end - pci_pos - 8);
 				uint16_t vendor = 0, device_id = 0;
 				const auto separator = pci_id.find(':');
 				if (separator == string::npos) continue;
 				vendor = parse_hex(pci_id.substr(0, separator));
 				device_id = parse_hex(pci_id.substr(separator + 1));
 
-				const auto driver_line_end = driver.find('\n', driver_pos);
-				const string driver_name = driver.substr(driver_pos + 7,
-					driver_line_end == string::npos ? string::npos : driver_line_end - driver_pos - 7);
 				if (driver_name == "simple-framebuffer") {
 					Logger::debug("NPU: skipping {} because it uses simple-framebuffer", entry.path());
 					continue;
