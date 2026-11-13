@@ -439,9 +439,9 @@ namespace Shared {
 			Gpu::Intel::init();
 		}
 
-		if (shown_gpus.contains("npu")) {
-			Gpu::Npu::init();
-		}
+		// NPUs are exposed through the accelerator class rather than a GPU vendor
+		// backend, so discover them automatically for CPU-box GPU statistics.
+		Gpu::Npu::init();
 
 		if (not Gpu::gpu_names.empty()) {
 			for (auto const& [key, _] : Gpu::gpus[0].gpu_percent)
@@ -2467,19 +2467,28 @@ namespace Gpu {
 
 			std::error_code ec;
 			const fs::path accel_root("/sys/class/accel");
-			if (not fs::is_directory(accel_root, ec)) return false;
+			if (not fs::is_directory(accel_root, ec)) {
+				Logger::debug("NPU: {} is not present", accel_root);
+				return false;
+			}
 
 			for (const auto& entry : fs::directory_iterator(accel_root, ec)) {
 				if (not entry.is_directory()) continue;
 				const auto device = entry.path() / "device";
 				const auto uevent = device / "uevent";
-				if (not fs::exists(uevent)) continue;
+				if (not fs::exists(uevent)) {
+					Logger::debug("NPU: skipping {} because its uevent file is missing", entry.path());
+					continue;
+				}
 
 				const string driver = readfile(uevent, "");
 				const auto driver_pos = driver.find("DRIVER=");
 				const auto pci_pos = driver.find("PCI_ID=");
 				const auto slot_pos = driver.find("PCI_SLOT_NAME=");
-				if (pci_pos == string::npos or slot_pos == string::npos) continue;
+				if (pci_pos == string::npos or slot_pos == string::npos) {
+					Logger::debug("NPU: skipping {} because PCI_ID or PCI_SLOT_NAME is missing", entry.path());
+					continue;
+				}
 
 				const auto pci_line_end = driver.find('\n', pci_pos);
 				const auto pci_id = driver.substr(pci_pos + 8, pci_line_end - pci_pos - 8);
@@ -2490,8 +2499,12 @@ namespace Gpu {
 				device_id = parse_hex(pci_id.substr(separator + 1));
 
 				const auto driver_line_end = driver.find('\n', driver_pos);
-				const string driver_name = driver.substr(driver_pos + 7, driver_line_end - driver_pos - 7);
-				if (driver_name == "simple-framebuffer") continue;
+				const string driver_name = driver.substr(driver_pos + 7,
+					driver_line_end == string::npos ? string::npos : driver_line_end - driver_pos - 7);
+				if (driver_name == "simple-framebuffer") {
+					Logger::debug("NPU: skipping {} because it uses simple-framebuffer", entry.path());
+					continue;
+				}
 
 				device_paths npu{
 					entry.path(),
@@ -2515,13 +2528,20 @@ namespace Gpu {
 				npu.has_power = not npu.hwmon.empty() and
 					(fs::exists(npu.hwmon / "power1_average") or fs::exists(npu.hwmon / "power1_input"));
 
-				if (not (npu.has_busy or npu.has_busy_time or npu.has_temp or npu.has_power or npu.has_frequency))
+				if (not (npu.has_busy or npu.has_busy_time or npu.has_temp or npu.has_power or npu.has_frequency)) {
+					Logger::debug("NPU: skipping {} because no readable metrics were found", entry.path());
 					continue;
+				}
+				Logger::debug("NPU: found {} (driver={}, PCI ID={:04x}:{:04x})",
+					entry.path(), npu.driver, npu.vendor, npu.device);
 				devices.push_back(std::move(npu));
 			}
 
 			device_count = static_cast<uint32_t>(devices.size());
-			if (device_count == 0) return false;
+			if (device_count == 0) {
+				Logger::debug("NPU: no usable accelerator devices found");
+				return false;
+			}
 
 			const auto offset = gpus.size();
 			gpus.resize(offset + device_count);
