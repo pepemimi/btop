@@ -34,9 +34,11 @@ tab-size = 4
 
 #include <arpa/inet.h> // for inet_ntop()
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -317,6 +319,34 @@ namespace Gpu {
 		uint32_t device_count = 0;
 		vector<device_paths> devices;
 	}
+
+	//? Linux accelerator (NPU) data collection through /sys/class/accel.
+	namespace Npu {
+		struct device_paths {
+			std::filesystem::path accel;
+			std::filesystem::path hwmon;
+			string driver;
+			uint16_t vendor;
+			uint16_t device;
+			bool intel;
+			bool amd;
+			bool has_busy;
+			bool has_busy_time;
+			bool has_vram;
+			bool has_temp;
+			bool has_power;
+			bool has_frequency;
+			long long last_busy_time_us;
+			long long last_busy_timestamp_us;
+		};
+
+		bool initialized = false;
+		bool init();
+		bool shutdown();
+		template <bool is_init> bool collect(gpu_info* gpus_slice);
+		uint32_t device_count = 0;
+		vector<device_paths> devices;
+	}
 }
 
 #endif // GPU_SUPPORT
@@ -407,6 +437,10 @@ namespace Shared {
 
 		if (shown_gpus.contains("intel")) {
 			Gpu::Intel::init();
+		}
+
+		if (shown_gpus.contains("npu")) {
+			Gpu::Npu::init();
 		}
 
 		if (not Gpu::gpu_names.empty()) {
@@ -2307,6 +2341,322 @@ namespace Gpu {
 		template bool collect<1>(gpu_info*);
 	}
 
+	//? NPU data collection. NPUs expose a DRM accelerator node rather than a
+	// DRM card, so they are represented as GPU entries for the existing UI.
+	namespace Npu {
+		namespace {
+			static long long read_ll(const fs::path& path, long long fallback = 0) {
+				try {
+					return stoll(readfile(path, to_string(fallback)));
+				} catch (const std::exception&) {
+					return fallback;
+				}
+			}
+
+			static fs::path find_hwmon(const fs::path& device) {
+				std::error_code ec;
+				const auto hwmon_dir = device / "hwmon";
+				if (not fs::is_directory(hwmon_dir, ec)) return {};
+				for (const auto& entry : fs::directory_iterator(hwmon_dir, ec)) {
+					if (entry.is_directory()) return entry.path();
+				}
+				return {};
+			}
+
+			static uint16_t parse_hex(const string& value) {
+				try {
+					return static_cast<uint16_t>(stoul(value, nullptr, 16));
+				} catch (const std::exception&) {
+					return 0;
+				}
+			}
+
+			static double sensor_value(uint32_t input, int8_t exponent) {
+				return static_cast<double>(input) * pow(10.0, exponent);
+			}
+
+			constexpr unsigned char drm_ioctl_base = 'd';
+			constexpr unsigned char drm_command_base = 0x40;
+			constexpr unsigned char amdxna_get_info_cmd = 7;
+			constexpr uint32_t amdxna_query_sensors = 4;
+			constexpr uint32_t amdxna_query_clock_metadata = 3;
+
+			struct amdxna_get_info {
+				uint32_t param;
+				uint32_t buffer_size;
+				uint64_t buffer;
+			};
+
+			struct amdxna_clock {
+				uint8_t name[16];
+				uint32_t freq_mhz;
+				uint32_t padding;
+			};
+
+			struct amdxna_clock_metadata {
+				amdxna_clock mp_npu_clock;
+				amdxna_clock h_clock;
+			};
+
+			struct amdxna_sensor {
+				uint8_t label[64];
+				uint32_t input;
+				uint32_t max;
+				uint32_t average;
+				uint32_t highest;
+				uint8_t status[64];
+				uint8_t units[16];
+				int8_t unitm;
+				uint8_t sensor_type;
+				uint8_t padding[6];
+			};
+
+			static constexpr unsigned char sensor_type_power = 0;
+			static constexpr unsigned char sensor_type_column_utilization = 1;
+
+			static int open_accel(const device_paths& device) {
+				return open((fs::path("/dev/accel") / device.accel.filename()).c_str(), O_RDONLY | O_CLOEXEC);
+			}
+
+			template <typename T>
+			static bool amdxna_get(const device_paths& device, uint32_t param, T& data) {
+				const int fd = open_accel(device);
+				if (fd < 0) return false;
+
+				amdxna_get_info info{
+					param,
+					static_cast<uint32_t>(sizeof(data)),
+					reinterpret_cast<uint64_t>(&data),
+				};
+				const auto request = _IOC(_IOC_READ | _IOC_WRITE, drm_ioctl_base,
+					drm_command_base + amdxna_get_info_cmd, sizeof(info));
+				const bool success = ioctl(fd, request, &info) >= 0;
+				close(fd);
+				return success;
+			}
+
+			static bool query_sensors(const device_paths& device, array<amdxna_sensor, 16>& sensors, size_t& count) {
+				amdxna_get_info info{
+					amdxna_query_sensors,
+					static_cast<uint32_t>(sizeof(sensors)),
+					reinterpret_cast<uint64_t>(sensors.data()),
+				};
+				const int fd = open_accel(device);
+				if (fd < 0) return false;
+				const auto request = _IOC(_IOC_READ | _IOC_WRITE, drm_ioctl_base,
+					drm_command_base + amdxna_get_info_cmd, sizeof(info));
+				const bool success = ioctl(fd, request, &info) >= 0;
+				close(fd);
+				if (not success) return false;
+				count = min<size_t>(info.buffer_size / sizeof(amdxna_sensor), sensors.size());
+				return true;
+			}
+
+			static bool query_clocks(const device_paths& device, long long& core, long long& memory) {
+				amdxna_clock_metadata clocks{};
+				if (not amdxna_get(device, amdxna_query_clock_metadata, clocks)) return false;
+				core = static_cast<long long>(clocks.h_clock.freq_mhz) * 1'000'000;
+				memory = static_cast<long long>(clocks.mp_npu_clock.freq_mhz) * 1'000'000;
+				return true;
+			}
+		}
+
+		bool init() {
+			if (initialized) return false;
+			devices.clear();
+
+			std::error_code ec;
+			const fs::path accel_root("/sys/class/accel");
+			if (not fs::is_directory(accel_root, ec)) return false;
+
+			for (const auto& entry : fs::directory_iterator(accel_root, ec)) {
+				if (not entry.is_directory()) continue;
+				const auto device = entry.path() / "device";
+				const auto uevent = device / "uevent";
+				if (not fs::exists(uevent)) continue;
+
+				const string driver = readfile(uevent, "");
+				const auto driver_pos = driver.find("DRIVER=");
+				const auto pci_pos = driver.find("PCI_ID=");
+				const auto slot_pos = driver.find("PCI_SLOT_NAME=");
+				if (pci_pos == string::npos or slot_pos == string::npos) continue;
+
+				const auto pci_line_end = driver.find('\n', pci_pos);
+				const auto pci_id = driver.substr(pci_pos + 8, pci_line_end - pci_pos - 8);
+				uint16_t vendor = 0, device_id = 0;
+				const auto separator = pci_id.find(':');
+				if (separator == string::npos) continue;
+				vendor = parse_hex(pci_id.substr(0, separator));
+				device_id = parse_hex(pci_id.substr(separator + 1));
+
+				const auto driver_line_end = driver.find('\n', driver_pos);
+				const string driver_name = driver.substr(driver_pos + 7, driver_line_end - driver_pos - 7);
+				if (driver_name == "simple-framebuffer") continue;
+
+				device_paths npu{
+					entry.path(),
+					find_hwmon(device),
+					driver_name,
+					vendor,
+					device_id,
+					vendor == 0x8086 or driver_name == "intel_vpu",
+					vendor == 0x1002 or driver_name == "amdxdna",
+					fs::exists(device / "npu_busy_percent"),
+					fs::exists(device / "npu_busy_time_us"),
+					fs::exists(device / "npu_memory_total") and
+						(fs::exists(device / "npu_memory_utilization") or fs::exists(device / "npu_memory_used")),
+					false,
+					false,
+					fs::exists(device / "npu_current_frequency_mhz"),
+					0,
+					0,
+				};
+				npu.has_temp = not npu.hwmon.empty() and fs::exists(npu.hwmon / "temp1_input");
+				npu.has_power = not npu.hwmon.empty() and
+					(fs::exists(npu.hwmon / "power1_average") or fs::exists(npu.hwmon / "power1_input"));
+
+				if (not (npu.has_busy or npu.has_busy_time or npu.has_temp or npu.has_power or npu.has_frequency))
+					continue;
+				devices.push_back(std::move(npu));
+			}
+
+			device_count = static_cast<uint32_t>(devices.size());
+			if (device_count == 0) return false;
+
+			const auto offset = gpus.size();
+			gpus.resize(offset + device_count);
+			gpu_names.resize(offset + device_count);
+			for (uint32_t i = 0; i < device_count; ++i) {
+				const auto& npu = devices[i];
+				const auto vendor = npu.intel ? "Intel" : npu.amd ? "AMD" : "Other";
+				gpu_names[offset + i] = fmt::format("{} NPU ({:04x}:{:04x})", vendor, npu.vendor, npu.device);
+			}
+
+			initialized = true;
+			collect<1>(gpus.data() + offset);
+			Logger::info("Using accelerator sysfs for {} NPU(s)", device_count);
+			return true;
+		}
+
+		bool shutdown() {
+			if (not initialized) return false;
+			devices.clear();
+			device_count = 0;
+			initialized = false;
+			return true;
+		}
+
+		template <bool is_init> bool collect(gpu_info* gpus_slice) {
+			if (not initialized) return false;
+
+			for (uint32_t i = 0; i < device_count; ++i) {
+				auto& gpu = gpus_slice[i];
+				auto& npu = devices[i];
+
+				if constexpr (is_init) {
+					gpu.supported_functions = {
+						.gpu_utilization = npu.has_busy or npu.has_busy_time or npu.amd,
+						.mem_utilization = false,
+						.gpu_clock = npu.has_frequency or npu.amd,
+						.mem_clock = npu.amd,
+						.pwr_usage = npu.has_power or npu.amd,
+						.pwr_state = false,
+						.temp_info = npu.has_temp,
+						.mem_total = npu.has_vram,
+						.mem_used = npu.has_vram,
+						.pcie_txrx = false,
+						.encoder_utilization = false,
+						.decoder_utilization = false,
+					};
+					gpu.pwr_max_usage = 0;
+				}
+
+				if (npu.has_busy_time) {
+					const auto now = get_monotonicTimeUSec();
+					const auto busy = read_ll(npu.accel / "device/npu_busy_time_us");
+					const auto elapsed = now - npu.last_busy_timestamp_us;
+					if (elapsed > 0) {
+						const auto usage = clamp(static_cast<long long>(round((busy - npu.last_busy_time_us) * 100.0 / elapsed)), 0LL, 100LL);
+						gpu.gpu_percent.at("gpu-totals").push_back(usage);
+					}
+					npu.last_busy_time_us = busy;
+					npu.last_busy_timestamp_us = now;
+				} else if (npu.has_busy) {
+					gpu.gpu_percent.at("gpu-totals").push_back(
+						clamp(read_ll(npu.accel / "device/npu_busy_percent"), 0LL, 100LL));
+				}
+
+				if (npu.has_temp)
+					gpu.temp.push_back(read_ll(npu.hwmon / "temp1_input") / 1000);
+
+				if (npu.has_power) {
+					const auto power_path = fs::exists(npu.hwmon / "power1_average")
+						? npu.hwmon / "power1_average" : npu.hwmon / "power1_input";
+					gpu.pwr_usage = read_ll(power_path) / 1000;
+					gpu.pwr_max_usage = max(gpu.pwr_max_usage, gpu.pwr_usage);
+					if (gpu.pwr_max_usage > 0)
+						gpu.gpu_percent.at("gpu-pwr-totals").push_back(
+							clamp(static_cast<long long>(round(gpu.pwr_usage * 100.0 / gpu.pwr_max_usage)), 0LL, 100LL));
+				}
+
+				long long core_clock = 0, memory_clock = 0;
+				if (npu.amd and query_clocks(npu, core_clock, memory_clock)) {
+					gpu.gpu_clock_speed = static_cast<unsigned int>(core_clock / 1'000'000);
+					gpu.mem_clock_speed = memory_clock / 1'000'000;
+				} else if (npu.has_frequency) {
+					gpu.gpu_clock_speed = static_cast<unsigned int>(
+						read_ll(npu.accel / "device/npu_current_frequency_mhz"));
+				} else if (not npu.hwmon.empty()) {
+					gpu.gpu_clock_speed = static_cast<unsigned int>(read_ll(npu.hwmon / "freq1_input") / 1'000'000);
+				}
+
+				if (npu.has_vram) {
+					const auto used_path = fs::exists(npu.accel / "device/npu_memory_used")
+						? npu.accel / "device/npu_memory_used"
+						: npu.accel / "device/npu_memory_utilization";
+					gpu.mem_total = read_ll(npu.accel / "device/npu_memory_total");
+					gpu.mem_used = read_ll(used_path);
+					if (gpu.mem_total > 0)
+						gpu.gpu_percent.at("gpu-vram-totals").push_back(
+							clamp(static_cast<long long>(round(gpu.mem_used * 100.0 / gpu.mem_total)), 0LL, 100LL));
+				}
+
+				if (npu.amd) {
+					array<amdxna_sensor, 16> sensors{};
+					size_t sensor_count = 0;
+					if (query_sensors(npu, sensors, sensor_count)) {
+						bool sensor_power = false;
+						for (size_t s = 0; s < sensor_count; ++s) {
+							if (sensors[s].sensor_type == sensor_type_power and not npu.has_power) {
+								gpu.pwr_usage = static_cast<long long>(sensor_value(sensors[s].input, sensors[s].unitm) * 1000.0);
+								sensor_power = true;
+							}
+							if (sensors[s].sensor_type == sensor_type_column_utilization and not npu.has_busy) {
+								const auto usage = sensor_value(sensors[s].input, sensors[s].unitm);
+								gpu.gpu_percent.at("gpu-totals").push_back(clamp(static_cast<long long>(round(usage)), 0LL, 100LL));
+							}
+						}
+						if (sensor_power) {
+							gpu.pwr_max_usage = max(gpu.pwr_max_usage, gpu.pwr_usage);
+							if (gpu.pwr_max_usage > 0)
+								gpu.gpu_percent.at("gpu-pwr-totals").push_back(
+									clamp(static_cast<long long>(round(gpu.pwr_usage * 100.0 / gpu.pwr_max_usage)), 0LL, 100LL));
+						}
+					}
+				}
+
+				if (gpu.supported_functions.gpu_utilization and gpu.gpu_percent.at("gpu-totals").empty())
+					gpu.gpu_percent.at("gpu-totals").push_back(0);
+				if (gpu.supported_functions.pwr_usage and gpu.gpu_percent.at("gpu-pwr-totals").empty())
+					gpu.gpu_percent.at("gpu-pwr-totals").push_back(0);
+			}
+			return true;
+		}
+
+		template bool collect<0>(gpu_info*);
+		template bool collect<1>(gpu_info*);
+	}
+
 	//? Collect data from GPU-specific libraries
 	auto collect(bool no_update) -> vector<gpu_info>& {
 		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
@@ -2318,6 +2668,7 @@ namespace Gpu {
 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
 		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
+		Npu::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count);
 
 		//* Calculate average usage
 		long long avg = 0;
