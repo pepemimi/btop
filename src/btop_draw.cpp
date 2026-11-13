@@ -828,9 +828,13 @@ namespace Cpu {
 								continue;
 							}
 							if (Gpu::count - (gpu_auto ? Gpu::shown : 0) > 1) {
-								auto i_str = to_string(i);
-								out += Mv::l(max(0, graph_width-1)) + Mv::u(graph_height/2) + (graph_width > 5 ? "GPU" : "") + i_str
-									+ Mv::d(graph_height/2) + Mv::r(max(0, (int)(graph_width - 1 - (graph_width > 5)*3 - i_str.size())));
+								const auto device_label = gpus[i].is_npu ? "NPU" : "GPU";
+								auto i_str = to_string(gpus[i].is_npu ? gpus[i].device_index : i);
+								const auto label = string(device_label) + i_str;
+								const bool show_label = graph_width > static_cast<int>(label.size()) + 2;
+								out += Mv::l(max(0, graph_width-1)) + Mv::u(graph_height/2)
+									+ (show_label ? label : "") + Mv::d(graph_height/2)
+									+ Mv::r(max(0, graph_width - 1 - (show_label ? static_cast<int>(label.size()) : 0)));
 							}
 
 							if (++gpu_drawn < Gpu::count - (gpu_auto ? Gpu::shown : 0))

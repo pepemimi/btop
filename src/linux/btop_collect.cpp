@@ -2581,6 +2581,8 @@ namespace Gpu {
 				auto& npu = devices[i];
 
 				if constexpr (is_init) {
+					gpu.is_npu = true;
+					gpu.device_index = i;
 					gpu.supported_functions = {
 						.gpu_utilization = npu.has_busy or npu.has_busy_time or npu.amd,
 						.mem_utilization = false,

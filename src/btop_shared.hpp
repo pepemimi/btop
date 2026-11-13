@@ -150,6 +150,8 @@ namespace Gpu {
 
 	//* Per-device container for GPU info
 	struct gpu_info {
+		bool is_npu = false;
+		unsigned int device_index = 0;
 		std::unordered_map<string, deque<long long>> gpu_percent = {
 			{"gpu-totals", {}},
 			{"gpu-vram-totals", {}},
