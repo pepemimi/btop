@@ -1099,8 +1099,10 @@ namespace Cpu {
 			for (unsigned long i = 0; i < gpus.size(); ++i) {
 				if (gpu_auto and v_contains(Gpu::shown_panels, i))
 					continue;
-				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
-				if (gpus.size() > 1) out += rjust(to_string(i), 1 + (gpus.size() > 9));
+				const auto device_label = gpus[i].is_npu ? "NPU" : "GPU";
+				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + device_label;
+				if (gpus.size() > 1)
+					out += rjust(to_string(gpus[i].is_npu ? gpus[i].device_index : i), 1 + (gpus.size() > 9));
 				if (gpus[i].supported_functions.gpu_utilization) {
 					out += ' ';
 					if (b_columns > 1) {
