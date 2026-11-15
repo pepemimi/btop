@@ -618,7 +618,7 @@ namespace Menu {
 				"Manually set which gpu vendors to show.",
 				"",
 				"Available values are",
-				"\"nvidia\", \"amd\", \"intel\",",
+				"\"nvidia\", \"amd\", \"intel\", \"npu\",",
 				"and \"apple\".",
 				"Separate values with whitespace.",
 				"",

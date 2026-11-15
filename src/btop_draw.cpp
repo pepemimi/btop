@@ -828,9 +828,13 @@ namespace Cpu {
 								continue;
 							}
 							if (Gpu::count - (gpu_auto ? Gpu::shown : 0) > 1) {
-								auto i_str = to_string(i);
-								out += Mv::l(max(0, graph_width-1)) + Mv::u(graph_height/2) + (graph_width > 5 ? "GPU" : "") + i_str
-									+ Mv::d(graph_height/2) + Mv::r(max(0, (int)(graph_width - 1 - (graph_width > 5)*3 - i_str.size())));
+								const auto device_label = gpus[i].is_npu ? "NPU" : "GPU";
+								auto i_str = to_string(gpus[i].is_npu ? gpus[i].device_index : i);
+								const auto label = string(device_label) + i_str;
+								const bool show_label = graph_width > static_cast<int>(label.size()) + 2;
+								out += Mv::l(max(0, graph_width-1)) + Mv::u(graph_height/2)
+									+ (show_label ? label : "") + Mv::d(graph_height/2)
+									+ Mv::r(max(0, graph_width - 1 - (show_label ? static_cast<int>(label.size()) : 0)));
 							}
 
 							if (++gpu_drawn < Gpu::count - (gpu_auto ? Gpu::shown : 0))
@@ -1095,8 +1099,10 @@ namespace Cpu {
 			for (unsigned long i = 0; i < gpus.size(); ++i) {
 				if (gpu_auto and v_contains(Gpu::shown_panels, i))
 					continue;
-				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
-				if (gpus.size() > 1) out += rjust(to_string(i), 1 + (gpus.size() > 9));
+				const auto device_label = gpus[i].is_npu ? "NPU" : "GPU";
+				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + device_label;
+				if (gpus.size() > 1)
+					out += rjust(to_string(gpus[i].is_npu ? gpus[i].device_index : i), 1 + (gpus.size() > 9));
 				if (gpus[i].supported_functions.gpu_utilization) {
 					out += ' ';
 					if (b_columns > 1) {
@@ -1233,7 +1239,8 @@ namespace Gpu {
 			if (not single_graph)
 				out += Mv::to(y + rows_used + graph_up_height, x + 1) + graph_lower(safeVal(gpu.gpu_percent, "gpu-totals"s), (data_same or redraw[index]));
 
-			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU " + gpu_meter(safeVal(gpu.gpu_percent, "gpu-totals"s).back())
+			const auto device_label = gpu.is_npu ? fmt::format("NPU{} ", gpu.device_index) : "GPU "s;
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg") + Fx::b + device_label + gpu_meter(safeVal(gpu.gpu_percent, "gpu-totals"s).back())
 				+ Theme::g("cpu").at(clamp(safeVal(gpu.gpu_percent, "gpu-totals"s).back(), 0ll, 100ll)) + rjust(to_string(safeVal(gpu.gpu_percent, "gpu-totals"s).back()), 5) + Theme::c("main_fg") + '%';
 
 			//? Temperature graph, I assume the device supports utilization if it supports temperature
